@@ -2,6 +2,7 @@ import RoutingKit
 import HTTPTypes
 import NIOPosix
 import NIOCore
+import NIOConcurrencyHelpers
 
 /// Determines how an incoming HTTP request's body is collected.
 public enum HTTPBodyStreamStrategy: Sendable {
@@ -154,10 +155,20 @@ extension RoutesBuilder {
     ) -> Route {
         let responder = BasicResponder { request in
             if case .collect(let max) = body, request.body.data == nil {
-                _ = try await MultiThreadedEventLoopGroup.singleton.any().flatSubmit {
-                    request.body.collect(max: max?.value ?? request.application.routes.defaultMaxBodySize.value)
-                }.get()
-
+                let maxBodySize = max?.value ?? request.application.routes.defaultMaxBodySize.value
+                if let stream = request.streamBodyStorage.withLockedValue({ $0 }) {
+                    // The Vapor 5 HTTP server delivers request bodies as an `AsyncStream`.
+                    // Collect it eagerly here so the configurable max body size is enforced
+                    // before the route handler runs (throws `Abort(.contentTooLarge)` on overflow).
+                    let buffer = try await request.collectStream(stream, maxSize: maxBodySize)
+                    request.bodyStorage.withLockedValue { $0 = .collected(buffer) }
+                    request.streamBodyStorage.withLockedValue { $0 = nil }
+                } else {
+                    // Fallback for the legacy body storage path.
+                    _ = try await MultiThreadedEventLoopGroup.singleton.any().flatSubmit {
+                        request.body.collect(max: maxBodySize)
+                    }.get()
+                }
             }
             return try await closure(request).encodeResponse(for: request)
         }
